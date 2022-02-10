@@ -430,13 +430,9 @@ class TaskExecutor:
         templar = Templar(loader=self._loader, variables=variables)
 
         context_validation_error = None
-
-        # a certain subset of variables exist.
-        tempvars = variables.copy()
-
         try:
-            # TODO: remove play_context as this does not take delegation nor loops correctly into account,
-            # the task itself should hold the correct values for connection/shell/become/terminal plugin options to finalize.
+            # TODO: remove play_context as this does not take delegation into account, task itself should hold values
+            #  for connection/shell/become/terminal plugin options to finalize.
             #  Kept for now for backwards compatibility and a few functions that are still exclusive to it.
 
             # apply the given task's information to the connection info,
@@ -454,23 +450,22 @@ class TaskExecutor:
                 self._play_context.remote_addr = self._host.address
 
             # We also add "magic" variables back into the variables dict to make sure
-            self._play_context.update_vars(tempvars)
+            # a certain subset of variables exist.
+            self._play_context.update_vars(variables)
 
         except AnsibleError as e:
             # save the error, which we'll raise later if we don't end up
             # skipping this task during the conditional evaluation step
             context_validation_error = e
 
-        no_log = self._play_context.no_log
-
         # Evaluate the conditional (if any) for this task, which we do before running
         # the final task post-validation. We do this before the post validation due to
         # the fact that the conditional may specify that the task be skipped due to a
         # variable not being present which would otherwise cause validation to fail
         try:
-            if not self._task.evaluate_conditional(templar, tempvars):
+            if not self._task.evaluate_conditional(templar, variables):
                 display.debug("when evaluation is False, skipping this task")
-                return dict(changed=False, skipped=True, skip_reason='Conditional result was False', _ansible_no_log=no_log)
+                return dict(changed=False, skipped=True, skip_reason='Conditional result was False', _ansible_no_log=self._play_context.no_log)
         except AnsibleError as e:
             # loop error takes precedence
             if self._loop_eval_error is not None:
@@ -499,9 +494,6 @@ class TaskExecutor:
             if raiseit:
                 raise context_validation_error  # pylint: disable=raising-bad-type
 
-        # set templar to use temp variables until loop is evaluated
-        templar.available_variables = tempvars
-
         # if this task is a TaskInclude, we just return now with a success code so the
         # main thread can expand the task list for the given host
         if self._task.action in C._ACTION_ALL_INCLUDE_TASKS:
@@ -524,7 +516,7 @@ class TaskExecutor:
         except AnsibleError as e:
             raise
         except Exception:
-            return dict(changed=False, failed=True, _ansible_no_log=no_log, exception=to_text(traceback.format_exc()))
+            return dict(changed=False, failed=True, _ansible_no_log=self._play_context.no_log, exception=to_text(traceback.format_exc()))
         if '_variable_params' in self._task.args:
             variable_params = self._task.args.pop('_variable_params')
             if isinstance(variable_params, dict):
@@ -534,54 +526,28 @@ class TaskExecutor:
                 variable_params.update(self._task.args)
                 self._task.args = variable_params
 
-        # update no_log to task value, now that we have it templated
-        no_log = self._task.no_log
-
-        # free tempvars up, not used anymore, cvars and vars_copy should be mainly used after this point
-        # updating the original 'variables' at the end
-        tempvars = {}
-
-        # setup cvars copy, used for all connection related templating
         if self._task.delegate_to:
             # use vars from delegated host (which already include task vars) instead of original host
             cvars = variables.get('ansible_delegated_vars', {}).get(self._task.delegate_to, {})
+            orig_vars = templar.available_variables
         else:
             # just use normal host vars
-            cvars = variables
+            cvars = orig_vars = variables
 
         templar.available_variables = cvars
-
-        # use magic var if it exists, if not, let task inheritance do it's thing.
-        if cvars.get('ansible_connection') is not None:
-            current_connection = templar.template(cvars['ansible_connection'])
-        else:
-            current_connection = self._task.connection
 
         # get the connection and the handler for this execution
         if (not self._connection or
                 not getattr(self._connection, 'connected', False) or
-                self._connection._load_name != current_connection or
-                # pc compare, left here for old plugins, but should be irrelevant for those
-                # using get_option, since they are cleared each iteration.
                 self._play_context.remote_addr != self._connection._play_context.remote_addr):
-            self._connection = self._get_connection(cvars, templar, current_connection)
+            self._connection = self._get_connection(cvars, templar)
         else:
             # if connection is reused, its _play_context is no longer valid and needs
             # to be replaced with the one templated above, in case other data changed
             self._connection._play_context = self._play_context
 
         plugin_vars = self._set_connection_options(cvars, templar)
-
-        # make a copy of the job vars here, as we update them here and later,
-        # but don't want to polute original
-        vars_copy = variables.copy()
-        # update with connection info (i.e ansible_host/ansible_user)
-        self._connection.update_vars(vars_copy)
-        templar.available_variables = vars_copy
-
-        # TODO: eventually remove as pc is taken out of the resolution path
-        # feed back into pc to ensure plugins not using get_option can get correct value
-        self._connection._play_context = self._play_context.set_task_and_variable_override(task=self._task, variables=vars_copy, templar=templar)
+        templar.available_variables = orig_vars
 
         # TODO: eventually remove this block as this should be a 'consequence' of 'forced_local' modules
         # special handling for python interpreter for network_os, default to ansible python unless overriden
@@ -619,6 +585,10 @@ class TaskExecutor:
         if delay < 0:
             delay = 1
 
+        # make a copy of the job vars here, in case we need to update them
+        # with the registered variable value later on when testing conditions
+        vars_copy = variables.copy()
+
         display.debug("starting attempt loop")
         result = None
         for attempt in range(1, retries + 1):
@@ -627,7 +597,7 @@ class TaskExecutor:
                 if self._task.timeout:
                     old_sig = signal.signal(signal.SIGALRM, task_timeout)
                     signal.alarm(self._task.timeout)
-                result = self._handler.run(task_vars=vars_copy)
+                result = self._handler.run(task_vars=variables)
             except (AnsibleActionFail, AnsibleActionSkip) as e:
                 return e.result
             except AnsibleConnectionFailure as e:
@@ -643,7 +613,7 @@ class TaskExecutor:
             display.debug("handler run complete")
 
             # preserve no log
-            result["_ansible_no_log"] = no_log
+            result["_ansible_no_log"] = self._play_context.no_log
 
             if self._task.action not in C._ACTION_WITH_CLEAN_FACTS:
                 result = wrap_var(result)
@@ -675,7 +645,7 @@ class TaskExecutor:
                                        task_fields=self._task.dump_attrs()))
 
                 # ensure no log is preserved
-                result["_ansible_no_log"] = no_log
+                result["_ansible_no_log"] = self._play_context.no_log
 
             # helper methods for use below in evaluating changed/failed_when
             def _evaluate_changed_when_result(result):
@@ -935,19 +905,25 @@ class TaskExecutor:
                                "Use `ansible-doc -t become -l` to list available plugins." % name)
         return become
 
-    def _get_connection(self, cvars, templar, current_connection):
+    def _get_connection(self, cvars, templar):
         '''
         Reads the connection property for the host, and returns the
         correct connection object from the list of connection plugins
         '''
 
-        self._play_context.connection = current_connection
+        # use magic var if it exists, if not, let task inheritance do it's thing.
+        if cvars.get('ansible_connection') is not None:
+            self._play_context.connection = templar.template(cvars['ansible_connection'])
+        else:
+            self._play_context.connection = self._task.connection
 
         # TODO: play context has logic to update the connection for 'smart'
         # (default value, will chose between ssh and paramiko) and 'persistent'
         # (really paramiko), eventually this should move to task object itself.
-        conn_type = self._play_context.connection
+        connection_name = self._play_context.connection
 
+        # load connection
+        conn_type = connection_name
         connection, plugin_load_context = self._shared_loader_obj.connection_loader.get_with_context(
             conn_type,
             self._play_context,
